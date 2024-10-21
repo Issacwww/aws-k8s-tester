@@ -72,9 +72,11 @@ type deployerOptions struct {
 	LogBucket                   string        `flag:"log-bucket" desc:"S3 bucket for storing logs for each run. If empty, logs will not be stored."`
 	NodeCreationTimeout         time.Duration `flag:"node-creation-timeout" desc:"Time to wait for nodes to be created/launched. This should consider instance availability."`
 	NodeReadyTimeout            time.Duration `flag:"node-ready-timeout" desc:"Time to wait for all nodes to become ready"`
+	NodeRoleArn                 string        `flag:"node-role-arn" desc:"Required when static-cluster-name specified for nodegroup creation"`
 	Nodes                       int           `flag:"nodes" desc:"number of nodes to launch in cluster"`
 	NodeNameStrategy            string        `flag:"node-name-strategy" desc:"Specifies the naming strategy for node. Allowed values: ['SessionName', 'EC2PrivateDNSName'], default to EC2PrivateDNSName"`
 	Region                      string        `flag:"region" desc:"AWS region for EKS cluster"`
+	StaticClusterName           string        `flag:"static-cluster-name" desc:"Optional when re-use existing cluster"`
 	TuneVPCCNI                  bool          `flag:"tune-vpc-cni" desc:"Apply tuning parameters to the VPC CNI DaemonSet"`
 	UnmanagedNodes              bool          `flag:"unmanaged-nodes" desc:"Use an AutoScalingGroup instead of an EKS-managed nodegroup. Requires --ami"`
 	UpClusterHeaders            []string      `flag:"up-cluster-header" desc:"Additional header to add to eks:CreateCluster requests. Specified in the same format as curl's -H flag."`
@@ -163,12 +165,12 @@ func (d *deployer) Up() error {
 			return err
 		}
 	}
-	if infra, err := d.infraManager.createInfrastructureStack(&d.deployerOptions); err != nil {
+	if infra, err := d.infraManager.getOrCreateInfrastructureStack(&d.deployerOptions); err != nil {
 		return err
 	} else {
 		d.infra = infra
 	}
-	cluster, err := d.clusterManager.createCluster(d.infra, &d.deployerOptions)
+	cluster, err := d.clusterManager.getOrCreateCluster(d.infra, &d.deployerOptions)
 	if err != nil {
 		return err
 	}
@@ -181,7 +183,7 @@ func (d *deployer) Up() error {
 	if err != nil {
 		return err
 	}
-	if d.UnmanagedNodes {
+	if d.UnmanagedNodes && d.StaticClusterName == "" {
 		if err := createAWSAuthConfigMap(d.k8sClient, d.NodeNameStrategy, d.infra.nodeRole); err != nil {
 			return err
 		}
@@ -235,6 +237,12 @@ func (d *deployer) verifyUpFlags() error {
 	if d.IPFamily == "" {
 		d.IPFamily = string(ekstypes.IpFamilyIpv4)
 		klog.Infof("Using default IP family: %s", d.IPFamily)
+	}
+	if d.StaticClusterName != "" {
+		if d.NodeRoleArn == "" {
+			return fmt.Errorf("--node-role-arn must be specified for --static-cluster-name")
+		}
+		d.nodegroupManager.resourceID = d.StaticClusterName + "-" + d.commonOptions.RunID()
 	}
 	if d.UnmanagedNodes {
 		if d.AMI == "" {
@@ -297,21 +305,30 @@ func (d *deployer) Down() error {
 		klog.Warningf("failed to gather logs from nodes: %v", err)
 		// don't return err, this isn't critical
 	}
-	return deleteResources(d.infraManager, d.clusterManager, d.nodegroupManager)
+	return deleteResources(d.infraManager, d.clusterManager, d.nodegroupManager, d.deployerOptions.StaticClusterName, d.commonOptions.RunID())
 }
 
-func deleteResources(im *InfrastructureManager, cm *ClusterManager, nm *NodegroupManager) error {
+func deleteResources(im *InfrastructureManager, cm *ClusterManager, nm *NodegroupManager, staticClusterName, runId string) error {
+	if staticClusterName != "" {
+		nm.resourceID = staticClusterName + "-" + runId
+	}
 	if err := nm.deleteNodegroup(); err != nil {
 		return err
 	}
-	// the EKS-managed cluster security group may be associated with a leaked ENI
-	// so we need to make sure we've deleted leaked ENIs before we delete the cluster
-	// otherwise, the cluster security group will be left behind and will block deletion of our VPC
-	if err := im.deleteLeakedENIs(); err != nil {
-		return err
+
+	if staticClusterName == "" {
+		// the EKS-managed cluster security group may be associated with a leaked ENI
+		// so we need to make sure we've deleted leaked ENIs before we delete the cluster
+		// otherwise, the cluster security group will be left behind and will block deletion of our VPC
+
+		if err := im.deleteLeakedENIs(); err != nil {
+			return err
+		}
+		//only clean up cluster and infra for empheral cluster
+		if err := cm.deleteCluster(); err != nil {
+			return err
+		}
+		return im.deleteInfrastructureStack()
 	}
-	if err := cm.deleteCluster(); err != nil {
-		return err
-	}
-	return im.deleteInfrastructureStack()
+	return nil
 }

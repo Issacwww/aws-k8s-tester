@@ -68,7 +68,8 @@ func (j *janitor) Sweep(ctx context.Context) error {
 			clusterManager := NewClusterManager(clients, resourceID)
 			nodegroupManager := NewNodegroupManager(clients, resourceID)
 			klog.Infof("deleting resources (%v old): %s", resourceAge, resourceID)
-			if err := deleteResources(infraManager, clusterManager, nodegroupManager); err != nil {
+			//TODO: Add support for janitor to clean up static resource
+			if err := deleteResources(infraManager, clusterManager, nodegroupManager, "", ""); err != nil {
 				errs = append(errs, fmt.Errorf("failed to delete resources: %s: %v", resourceID, err))
 			}
 		}

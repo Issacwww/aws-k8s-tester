@@ -16,6 +16,8 @@ import (
 	cloudwatchtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/eks"
+	"github.com/aws/smithy-go"
 	"k8s.io/klog"
 
 	"github.com/aws/aws-k8s-tester/kubetest2/internal/deployers/eksapi/templates"
@@ -80,95 +82,210 @@ func (i *Infrastructure) subnets() []string {
 	return append(i.subnetsPublic, i.subnetsPrivate...)
 }
 
-func (m *InfrastructureManager) createInfrastructureStack(opts *deployerOptions) (*Infrastructure, error) {
+func (m *InfrastructureManager) getOrCreateInfrastructureStack(opts *deployerOptions) (*Infrastructure, error) {
 	publicKeyMaterial, err := loadSSHPublicKey()
 	if err != nil {
 		return nil, err
 	}
-	// get two AZs for the subnets
-	azs, err := m.clients.EC2().DescribeAvailabilityZones(context.TODO(), &ec2.DescribeAvailabilityZonesInput{})
-	if err != nil {
-		return nil, err
-	}
-	var subnetAzs []string
-	if opts.CapacityReservation {
-		subnetAzs, err = m.getAZsWithCapacity(opts)
+	var infra *Infrastructure
+	if opts.StaticClusterName != "" {
+		klog.Infof("getting infrastructure resource for static cluster: %v", opts.StaticClusterName)
+		describeOutput, describeErr := m.clients.EKS().DescribeCluster(context.TODO(), &eks.DescribeClusterInput{
+			Name: &opts.StaticClusterName,
+		})
+		if describeErr != nil {
+			return nil, fmt.Errorf("failed to describe static cluster: %v", describeErr)
+		}
+		sshkeyPair, err := m.getOrCreateSSHKeyPair(publicKeyMaterial)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create SSH KeyPair: %v", err)
+		}
+		vpc := *describeOutput.Cluster.ResourcesVpcConfig.VpcId
+		sshSecurityGroup, err := m.getOrCreateSSHSecurityGroup(vpc)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get or create SSH security group for vpc %s: %v", infra.vpc, err)
+		}
+
+		infra = &Infrastructure{
+			nodeRole:   opts.NodeRoleArn,
+			sshKeyPair: sshkeyPair,
+			vpc:        vpc,
+			//TODO: split into private and public
+			subnetsPrivate:   describeOutput.Cluster.ResourcesVpcConfig.SubnetIds,
+			sshSecurityGroup: sshSecurityGroup,
+		}
+	} else {
+		// get two AZs for the subnets
+		azs, err := m.clients.EC2().DescribeAvailabilityZones(context.TODO(), &ec2.DescribeAvailabilityZonesInput{})
 		if err != nil {
 			return nil, err
 		}
-		for _, az := range azs.AvailabilityZones {
-			if len(subnetAzs) == 2 {
-				break
+		var subnetAzs []string
+		if opts.CapacityReservation {
+			subnetAzs, err = m.getAZsWithCapacity(opts)
+			if err != nil {
+				return nil, err
 			}
-			if !slices.Contains(subnetAzs, *az.ZoneName) {
-				subnetAzs = append(subnetAzs, *az.ZoneName)
+			for _, az := range azs.AvailabilityZones {
+				if len(subnetAzs) == 2 {
+					break
+				}
+				if !slices.Contains(subnetAzs, *az.ZoneName) {
+					subnetAzs = append(subnetAzs, *az.ZoneName)
+				}
+			}
+		} else {
+			for i := 0; i < 2; i++ {
+				subnetAzs = append(subnetAzs, *azs.AvailabilityZones[i].ZoneName)
 			}
 		}
-	} else {
-		for i := 0; i < 2; i++ {
-			subnetAzs = append(subnetAzs, *azs.AvailabilityZones[i].ZoneName)
+		klog.Infof("creating infrastructure stack with AZs: %v", subnetAzs)
+		input := cloudformation.CreateStackInput{
+			StackName:    aws.String(m.resourceID),
+			TemplateBody: aws.String(templates.Infrastructure),
+			Capabilities: []cloudformationtypes.Capability{cloudformationtypes.CapabilityCapabilityIam},
+			Parameters: []cloudformationtypes.Parameter{
+				{
+					ParameterKey:   aws.String("SSHPublicKeyMaterial"),
+					ParameterValue: aws.String(publicKeyMaterial),
+				},
+				{
+					ParameterKey:   aws.String("ResourceId"),
+					ParameterValue: aws.String(m.resourceID),
+				},
+				{
+					ParameterKey:   aws.String("Subnet01AZ"),
+					ParameterValue: aws.String(subnetAzs[0]),
+				},
+				{
+					ParameterKey:   aws.String("Subnet02AZ"),
+					ParameterValue: aws.String(subnetAzs[1]),
+				},
+			},
 		}
+		if opts.ClusterRoleServicePrincipal != "" {
+			input.Parameters = append(input.Parameters, cloudformationtypes.Parameter{
+				ParameterKey:   aws.String("AdditionalClusterRoleServicePrincipal"),
+				ParameterValue: aws.String(opts.ClusterRoleServicePrincipal),
+			})
+		}
+		if opts.EKSEndpointURL != "" {
+			input.Tags = []cloudformationtypes.Tag{
+				{
+					Key:   aws.String(eksEndpointURLTag),
+					Value: aws.String(opts.EKSEndpointURL),
+				},
+			}
+		}
+		klog.Infof("creating infrastructure stack...")
+		out, err := m.clients.CFN().CreateStack(context.TODO(), &input)
+		if err != nil {
+			return nil, err
+		}
+		klog.Infof("waiting for infrastructure stack to be created: %s", *out.StackId)
+		err = cloudformation.NewStackCreateCompleteWaiter(m.clients.CFN()).
+			Wait(context.TODO(),
+				&cloudformation.DescribeStacksInput{
+					StackName: out.StackId,
+				},
+				infraStackCreationTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("failed to wait for infrastructure stack creation: %w", err)
+		}
+
+		klog.Infof("getting infrastructure stack resources: %s", *out.StackId)
+		infra, err := m.getInfrastructureStackResources()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get infrastructure stack resources: %w", err)
+		}
+		klog.Infof("created infrastructure: %+v", infra)
 	}
-	klog.Infof("creating infrastructure stack with AZs: %v", subnetAzs)
-	input := cloudformation.CreateStackInput{
-		StackName:    aws.String(m.resourceID),
-		TemplateBody: aws.String(templates.Infrastructure),
-		Capabilities: []cloudformationtypes.Capability{cloudformationtypes.CapabilityCapabilityIam},
-		Parameters: []cloudformationtypes.Parameter{
+	return infra, nil
+}
+
+func (m *InfrastructureManager) getOrCreateSSHSecurityGroup(vpcId string) (string, error) {
+	groupName := "SSHSecurityGroup"
+	describeInput := &ec2.DescribeSecurityGroupsInput{
+		Filters: []ec2types.Filter{
 			{
-				ParameterKey:   aws.String("SSHPublicKeyMaterial"),
-				ParameterValue: aws.String(publicKeyMaterial),
+				Name:   aws.String("group-name"),
+				Values: []string{groupName},
 			},
 			{
-				ParameterKey:   aws.String("ResourceId"),
-				ParameterValue: aws.String(m.resourceID),
-			},
-			{
-				ParameterKey:   aws.String("Subnet01AZ"),
-				ParameterValue: aws.String(subnetAzs[0]),
-			},
-			{
-				ParameterKey:   aws.String("Subnet02AZ"),
-				ParameterValue: aws.String(subnetAzs[1]),
+				Name:   aws.String("vpc-id"),
+				Values: []string{vpcId},
 			},
 		},
 	}
-	if opts.ClusterRoleServicePrincipal != "" {
-		input.Parameters = append(input.Parameters, cloudformationtypes.Parameter{
-			ParameterKey:   aws.String("AdditionalClusterRoleServicePrincipal"),
-			ParameterValue: aws.String(opts.ClusterRoleServicePrincipal),
-		})
+
+	resp, err := m.clients.EC2().DescribeSecurityGroups(context.TODO(), describeInput)
+	if err != nil {
+		return "", fmt.Errorf("failed to describe security groups, %v", err)
 	}
-	if opts.EKSEndpointURL != "" {
-		input.Tags = []cloudformationtypes.Tag{
+
+	if len(resp.SecurityGroups) > 0 {
+		return *resp.SecurityGroups[0].GroupId, nil
+	}
+
+	sgInput := &ec2.CreateSecurityGroupInput{
+		GroupName:   aws.String(groupName),
+		Description: aws.String("SSH access for worker nodes"),
+		VpcId:       aws.String(vpcId),
+	}
+
+	sgOutput, err := m.clients.EC2().CreateSecurityGroup(context.TODO(), sgInput)
+	if err != nil {
+		return "", fmt.Errorf("failed to create security group, %v", err)
+	}
+
+	ingressInput := &ec2.AuthorizeSecurityGroupIngressInput{
+		GroupId: aws.String(*sgOutput.GroupId),
+		IpPermissions: []ec2types.IpPermission{
 			{
-				Key:   aws.String(eksEndpointURLTag),
-				Value: aws.String(opts.EKSEndpointURL),
+				IpProtocol: aws.String("tcp"),
+				FromPort:   aws.Int32(22),
+				ToPort:     aws.Int32(22),
+				IpRanges: []ec2types.IpRange{
+					{
+						CidrIp: aws.String("0.0.0.0/0"),
+					},
+				},
 			},
+		},
+	}
+
+	_, err = m.clients.EC2().AuthorizeSecurityGroupIngress(context.TODO(), ingressInput)
+	if err != nil {
+		return "", fmt.Errorf("failed to authorize ingress, %v", err)
+	}
+
+	return *sgOutput.GroupId, nil
+}
+func (m *InfrastructureManager) getOrCreateSSHKeyPair(publicKeyMaterial string) (string, error) {
+	keyPairName := "StaticKubetest2SSHKeyPair"
+	describeOutput, err := m.clients.EC2().DescribeKeyPairs(context.TODO(), &ec2.DescribeKeyPairsInput{
+		KeyNames: []string{keyPairName},
+	})
+
+	if err != nil {
+		var apiErr *smithy.GenericAPIError
+		if ok := errors.As(err, &apiErr); ok && apiErr.Code == "InvalidKeyPair.NotFound" {
+			createOutput, createErr := m.clients.EC2().ImportKeyPair(context.TODO(), &ec2.ImportKeyPairInput{
+				KeyName:           aws.String(keyPairName),
+				PublicKeyMaterial: []byte(publicKeyMaterial),
+			})
+			if createErr != nil {
+				return "", fmt.Errorf("failed to create key pair: %w", createErr)
+			}
+			return *createOutput.KeyName, nil
 		}
+		return "", fmt.Errorf("failed to describe key pair: %w", err)
 	}
-	klog.Infof("creating infrastructure stack...")
-	out, err := m.clients.CFN().CreateStack(context.TODO(), &input)
-	if err != nil {
-		return nil, err
+
+	if len(describeOutput.KeyPairs) > 0 {
+		return *describeOutput.KeyPairs[0].KeyName, nil
 	}
-	klog.Infof("waiting for infrastructure stack to be created: %s", *out.StackId)
-	err = cloudformation.NewStackCreateCompleteWaiter(m.clients.CFN()).
-		Wait(context.TODO(),
-			&cloudformation.DescribeStacksInput{
-				StackName: out.StackId,
-			},
-			infraStackCreationTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("failed to wait for infrastructure stack creation: %w", err)
-	}
-	klog.Infof("getting infrastructure stack resources: %s", *out.StackId)
-	infra, err := m.getInfrastructureStackResources()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get infrastructure stack resources: %w", err)
-	}
-	klog.Infof("created infrastructure: %+v", infra)
-	return infra, nil
+	return "", fmt.Errorf("unexpected error, no key pair found or created")
 }
 
 func (m *InfrastructureManager) getInfrastructureStackResources() (*Infrastructure, error) {
